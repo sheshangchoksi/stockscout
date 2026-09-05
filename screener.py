@@ -299,7 +299,16 @@ def _fetch_company_page(symbol: str, bse_code: "str | None") -> "tuple[str, str]
     """Returns (html, slug_used) trying, in order: consolidated view by
     symbol, standalone view by symbol (some companies — mostly banks/NBFCs —
     only publish standalone on screener), then the same two by BSE numeric
-    code for BSE-only names that aren't indexed by ticker symbol."""
+    code for BSE-only names that aren't indexed by ticker symbol.
+
+    A page only "counts" if its annual Profit & Loss table has a real
+    Sales/Revenue row — screener.in returns HTTP 200 with the
+    /consolidated/ section present but empty for companies that file no
+    consolidated financials (e.g. screener.in/company/DAVANGERE/consolidated/),
+    so presence of the section alone is not enough; that case must fall
+    through to the standalone URL for the same slug before moving on to
+    the next slug. Mirrors the check in sheshvaluations' bulk_valuation.py
+    (fetch_screener_bulk / _parse_screener_page)."""
     candidates = [symbol]
     if bse_code:
         candidates.append(bse_code)
@@ -307,9 +316,32 @@ def _fetch_company_page(symbol: str, bse_code: "str | None") -> "tuple[str, str]
         for suffix in ("consolidated/", ""):
             url = f"https://www.screener.in/company/{slug}/{suffix}"
             html = _fetch_url(url)
-            if html and ("company-ratios" in html or "top-ratios" in html or "profit-loss" in html):
+            if not html:
+                continue
+            if not ("company-ratios" in html or "top-ratios" in html or "profit-loss" in html):
+                continue
+            if _has_usable_revenue(html):
                 return html, slug
     return None, None
+
+
+def _has_usable_revenue(html: str) -> bool:
+    """True if the page's annual Profit & Loss table has a Sales/Revenue
+    row with at least one non-zero, non-None value. Without bs4 available
+    we can't check, so don't block on it (get_fundamentals() already
+    no-ops without bs4)."""
+    if not _HAS_BS4:
+        return True
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+    parsed = _parse_table(soup, "profit-loss")
+    if not parsed:
+        return False
+    _headers, rows = parsed
+    sales = _find_row(rows, "sales", "revenue")
+    return bool(sales) and any(v not in (None, 0) for v in sales)
 
 
 # ── number parsing (Indian comma grouping, %, Cr., parenthesised negatives) ─
