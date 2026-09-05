@@ -1,36 +1,27 @@
 """
-bhavcopy.py — NSE/BSE official EOD bhavcopy as a free, non-Yahoo substitute
-for the *daily* OHLCV calls in mode_positional.py and intraday_data.py.
+bhavcopy.py — NSE/BSE official EOD bhavcopy, the sole source of *daily*
+OHLCV for mode_positional.py. No Yahoo/yfinance anywhere in this app.
 =============================================================================
 
 WHY THIS EXISTS
 ----------------
-Every yfinance/Yahoo call this app makes goes through the same shared
-rate-limit gate (yf_ratelimit.py) and the same Yahoo IP-level throttling.
-NSE and BSE separately publish their own end-of-day data files for free,
-with no rate limit that matters to a single scanner instance -- using
-those for plain daily OHLCV removes that traffic from Yahoo entirely
-instead of just backing it off more aggressively.
+NSE and BSE each publish their own end-of-day data files for free, with
+no rate limit that matters to a single scanner instance. This is the
+only source mode_positional.py uses for daily OHLCV — there is no
+yfinance fallback; a symbol bhavcopy has no usable data for is skipped
+rather than fetched from Yahoo.
 
-WHAT THIS DOES AND DOES NOT REPLACE
+WHAT THIS DOES AND DOES NOT COVER
 -------------------------------------
-Bhavcopy is EOD data only -- one row per symbol per trading day. It can
-stand in for:
-  • mode_positional.py's ticker.history(period="3mo", interval="1d")
-    (the technical-indicator block: RSI/MACD/Bollinger/volume-multiple)
-  • intraday_data.py's ticker.history(period="5d", interval="1d")
-    (the "5-day daily reference" bars)
+Bhavcopy is EOD data only -- one row per symbol per trading day. It
+supplies mode_positional.py's technical-indicator block (RSI/MACD/
+Bollinger/volume-multiple).
 
-It does NOT and CANNOT replace:
-  • intraday_data.py's ticker.history(period="1d", interval="1m") --
-    1-minute intraday bars have no free public source for NSE/BSE; only
-    paid broker APIs (Kite, Upstox, Fyers, TrueData, ...) carry that.
-    This is also the call that produced almost all of the 429s in the
-    2026-09-03 log, so this module does not fix that flood -- it only
-    stops adding to Yahoo's load on top of it.
-  • fast_info (market cap, PE) or the financial statements in
-    mode_positional.py -- bhavcopy has no such data, those stay on
-    yfinance regardless.
+It does NOT supply fundamentals (market cap, P/E, financial statements)
+— that's screener.py's job, also with no yfinance fallback. And it
+cannot supply 1-minute intraday bars — no free public source exists for
+those on NSE/BSE (only paid broker APIs: Kite, Upstox, Fyers, TrueData,
+...) — which is why this app has no intraday-scanning mode.
 
 NOT LIVE-TESTED
 -----------------
@@ -40,12 +31,11 @@ below could not be exercised end-to-end. NSE in particular has changed
 its bhavcopy path and anti-bot requirements more than once historically;
 BSE's has moved even more often. Every entry point here is wrapped so a
 failure of any kind (wrong URL, changed format, blocked request, a
-holiday with no file) returns None rather than raising -- callers fall
-back to their existing yfinance path automatically, so a broken or
-stale fetch here never breaks a scan, it just fails to save any Yahoo
-calls that day. Run `python bhavcopy.py` once right after deploying and
-check the Streamlit Cloud log for the smoke-test output before assuming
-this is actually reducing Yahoo traffic.
+holiday with no file) returns None rather than raising -- since there is
+no fallback, a broken or stale fetch here means the affected symbols are
+simply skipped for that scan, not silently routed to Yahoo. Run
+`python bhavcopy.py` once right after deploying and check the log for
+the smoke-test output before trusting this at full-universe scale.
 
 CACHING / REQUEST SHAPE
 -------------------------
@@ -85,7 +75,7 @@ os.makedirs(_CACHE_DIR, exist_ok=True)
 # Enough calendar days of backward search to find ~65+ trading days even
 # with weekends/holidays mixed in.
 _MAX_LOOKBACK_CALENDAR_DAYS = 130
-_MIN_USABLE_ROWS = 5  # fewer than this isn't worth using over yfinance
+_MIN_USABLE_ROWS = 5  # fewer than this isn't enough history to be usable
 _REQUEST_TIMEOUT_S = 15.0
 
 _CHROME_UA = (
@@ -279,10 +269,10 @@ def debug_fetch_raw(exchange: str, day: "date | None" = None) -> "pd.DataFrame |
 
 def get_daily_series(yf_symbol: str, trading_days: int = 65) -> "pd.DataFrame | None":
     """Up to `trading_days` most recent trading days of open/high/low/close/
-    volume for one symbol, oldest first, columns matching what
-    mode_positional.py / intraday_data.py already build from yfinance's
-    .history(). Returns None (never raises) on any failure -- including an
-    unrecognized exchange suffix -- so callers fall back to yfinance."""
+    volume for one symbol, oldest first. Returns None (never raises) on any
+    failure -- including an unrecognized exchange suffix, or not enough
+    trading days found -- so callers skip the symbol; there is no yfinance
+    fallback."""
     symbol, exchange = _split_symbol(yf_symbol)
     if symbol is None:
         return None
@@ -308,8 +298,7 @@ def get_daily_series(yf_symbol: str, trading_days: int = 65) -> "pd.DataFrame | 
 
 
 def get_latest_daily(yf_symbol: str, n: int = 5) -> "pd.DataFrame | None":
-    """Convenience wrapper for intraday_data.py's short daily-reference
-    window (replaces ticker.history(period=f'{n}d', interval='1d'))."""
+    """Convenience wrapper for a short daily-reference window."""
     return get_daily_series(yf_symbol, trading_days=n)
 
 
@@ -319,8 +308,8 @@ def get_latest_daily(yf_symbol: str, n: int = 5) -> "pd.DataFrame | None":
 # NSE and BSE each publish an unofficial JSON "quote" endpoint carrying the
 # live last-traded price for free. Like the bhavcopy fetchers above, this is
 # NOT LIVE-TESTED from this environment; every failure mode returns None so
-# callers (fetch_live_price in mode_positional.py) fall back to yfinance's
-# 1-minute-bar call automatically.
+# callers (fetch_live_price in mode_positional.py) treat that stock as
+# having no live price for this refresh -- there is no yfinance fallback.
 def _get_nse_live_price(symbol: str) -> "float | None":
     referer = f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}"
     url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
@@ -360,9 +349,9 @@ def _get_bse_live_price(code: str) -> "float | None":
 
 
 def get_live_quote(yf_symbol: str, bse_code: "str | None" = None) -> "float | None":
-    """Free, non-Yahoo substitute for mode_positional.fetch_live_price()'s
-    1-minute-bar call. Returns None on any failure — caller falls back to
-    yfinance."""
+    """Free, non-Yahoo live quote for mode_positional.fetch_live_price().
+    Returns None on any failure — no yfinance fallback, caller just has no
+    live price for this refresh."""
     symbol, exchange = _split_symbol(yf_symbol)
     if symbol is None:
         return None
@@ -381,6 +370,7 @@ if __name__ == "__main__":
         s = get_daily_series(sym, trading_days=10)
         if s is None:
             print(f"{sym}: no bhavcopy data (fetch failed, or too little "
-                  f"history found) -- scans will keep using yfinance for this exchange")
+                  f"history found) -- this symbol will be skipped in a scan, "
+                  f"there is no yfinance fallback")
         else:
             print(f"{sym}: got {len(s)} days, latest close={s.iloc[-1]['close']}")

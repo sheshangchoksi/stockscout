@@ -16,7 +16,6 @@ import scanner_common as sc
 import mode_positional
 
 warnings.filterwarnings("ignore")
-logging.getLogger("yfinance").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
 

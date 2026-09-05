@@ -1,41 +1,36 @@
 """
-screener.py — screener.in as a free substitute for yfinance's *fundamentals*
-calls (fast_info/market-cap, income statement, balance sheet, quarterly
-income statement) in mode_positional.py.
+screener.py — screener.in as the sole source of *fundamentals* (market
+cap, P/E, income statement, balance sheet, quarterly income statement)
+for mode_positional.py. No Yahoo/yfinance anywhere in this app.
 ================================================================================
 
 WHY THIS EXISTS
 ----------------
-bhavcopy.py already removes Yahoo from the plain daily-OHLCV path (price,
-volume, RSI/MACD/BB). The remaining, much heavier Yahoo load per stock in
-mode_positional.fetch_stock_data() is FOUR separate calls to the most
-throttled Yahoo endpoints:
-    ticker.fast_info                (market cap, P/E)
-    ticker.income_stmt              (annual P&L, multi-year)
-    ticker.balance_sheet            (annual cash position)
-    ticker.quarterly_income_stmt    (QoQ/YoY growth)
-Across a 2,995-stock universe that's ~12,000 Yahoo calls just for
-fundamentals, on top of history — which is the actual reason a full scan
-takes forever even with bhavcopy already in place.
+bhavcopy.py covers the plain daily-OHLCV path (price, volume, RSI/MACD/BB).
+The other thing a positional scanner needs per stock is fundamentals —
+market cap, annual + quarterly P&L, cash position — and screener.in
+renders all of that on one HTML page per company:
+    current market cap, quarterly results (last ~12 quarters — enough for
+    QoQ *and* YoY), annual profit & loss (up to ~12 years, often with a
+    trailing-twelve-months column labelled "TTM"), and the annual balance
+    sheet. One HTTP GET covers everything this app needs.
 
-screener.in renders one HTML page per company that already contains every
-one of those numbers: current market cap, quarterly results (last ~12
-quarters — enough for QoQ *and* YoY), annual profit & loss (up to ~12 years,
-often with a trailing-twelve-months column labelled "TTM"), and the annual
-balance sheet. One HTTP GET replaces four Yahoo calls, and it isn't
-Yahoo-throttled at all.
-
-WHAT THIS DOES AND DOES NOT REPLACE
+WHAT THIS DOES AND DOES NOT COVER
 -------------------------------------
-Replaces (when parsing succeeds):
-  • fast_info.market_cap, fast_info.p_e_ratio
-  • income_stmt / financials  (annual Total Revenue, Net Income, multi-year)
-  • balance_sheet             (annual cash position, best-effort — see below)
-  • quarterly_income_stmt     (QoQ/YoY revenue & profit growth)
-Does NOT replace:
-  • Daily OHLCV — bhavcopy.py already owns that.
-  • 1-minute intraday bars — no free source exists for those (see
-    intraday_data.py's docstring); those calls stay on yfinance regardless.
+Supplies (when parsing succeeds):
+  • market cap, P/E
+  • annual Total Revenue, Net Income, multi-year history
+  • annual cash position (best-effort — see below)
+  • QoQ/YoY revenue & profit growth
+Does NOT cover:
+  • Daily OHLCV — bhavcopy.py owns that.
+  • 1-minute intraday bars — no free source exists for those on NSE/BSE
+    (only paid broker APIs), which is why this app has no intraday-
+    scanning mode at all rather than a half-working one on Yahoo.
+
+There is no yfinance fallback anywhere in this module: if this file
+returns None for a symbol, mode_positional.py skips that symbol for the
+scan rather than fetching its fundamentals from Yahoo.
 
 KNOWN LIMITATION — CASH ON BALANCE SHEET
 ------------------------------------------
@@ -44,8 +39,7 @@ screener.in's standard balance-sheet template does not carry a standalone
 folded into "Other Assets"); only some companies expose it explicitly.
 get_fundamentals() returns total_cash=None whenever it can't find an
 unambiguous cash row rather than guessing — callers already treat a
-missing/zero cash figure as "unknown, score neutrally on this factor",
-identical to how a yfinance gap in the same field already behaved.
+missing/zero cash figure as "unknown, score neutrally on this factor".
 
 NOT LIVE-TESTED
 -----------------
@@ -55,9 +49,9 @@ a live page. screener.in's page structure (section ids `top-ratios`,
 `quarters`, `profit-loss`, `balance-sheet`) has been stable for a long
 time, but every extraction step is wrapped so a parsing failure of any
 kind (id renamed, table restructured, page blocked) returns None rather
-than raising — mode_positional.py's caller falls back to the existing
-yfinance path automatically, so a broken or stale parser here never
-breaks a scan, it just fails to save any Yahoo calls for that stock. Run
+than raising — mode_positional.py's caller simply skips that stock for
+the scan (see above), so a broken or stale parser here never breaks a
+scan, it just means fewer stocks get scored that day. Run
 `python screener.py RELIANCE TCS INFY` once after deploying and read the
 printed output before assuming this is actually working — see the
 `__main__` block at the bottom.
@@ -422,12 +416,12 @@ def _pct_change(new: "float | None", old: "float | None") -> "float | None":
 
 
 # screener.in's quarterly/annual/balance-sheet tables report every rupee
-# figure in ₹ Crore, but yfinance's financial statements (and this app's
-# market-cap-relative scoring thresholds — rev_to_mcap_strong, etc.) are
-# built around plain rupees. Growth percentages and margins are ratios of
-# two same-table figures, so the Crore scaling cancels out and those need
-# no conversion; only figures that get compared against market_cap
-# (revenue, cash) need scaling up to match.
+# figure in ₹ Crore, but this app's market-cap-relative scoring thresholds
+# (rev_to_mcap_strong, etc.) are built around plain rupees. Growth
+# percentages and margins are ratios of two same-table figures, so the
+# Crore scaling cancels out and those need no conversion; only figures
+# that get compared against market_cap (revenue, cash) need scaling up
+# to match.
 _CRORE = 1e7
 
 
@@ -466,19 +460,20 @@ def _pe_ratio(ratios: dict) -> "float | None":
 
 # ── public API ───────────────────────────────────────────────────────────────
 def get_fundamentals(symbol: str, bse_code: "str | None" = None) -> "dict | None":
-    """Best-effort screener.in fundamentals for one NSE/BSE symbol, shaped to
-    drop straight into the same dict keys mode_positional.fetch_stock_data()
-    already builds from yfinance:
+    """Best-effort screener.in fundamentals for one NSE/BSE symbol:
         market_cap, pe_ratio, total_cash, latest_fy_revenue, profit_margin,
         qoq_revenue_growth, yoy_revenue_growth,
         qoq_profit_growth, yoy_profit_growth, historical_data
     Returns None (never raises) if screener has no page for this symbol, or
     if parsing failed to recover even the minimum useful fields (market cap
-    or latest revenue) — callers fall back to yfinance in that case.
+    or latest revenue). There is no yfinance fallback — the caller
+    (mode_positional.fetch_stock_data) skips the symbol for this scan when
+    this returns None.
     """
     if not _HAS_BS4:
         logger.warning("screener: beautifulsoup4 not installed — fundamentals "
-                        "will stay on yfinance until it's added to requirements.txt")
+                        "unavailable until it's added to requirements.txt "
+                        "(no yfinance fallback exists)")
         return None
 
     cache_key = f"fund:{symbol}"
@@ -552,7 +547,8 @@ def get_fundamentals(symbol: str, bse_code: "str | None" = None) -> "dict | None
             historical_data["years"].append(year_label)
             historical_data["revenues"].append(rev)
             historical_data["cash_amounts"].append(0)  # see KNOWN LIMITATION above
-        # most-recent-first, matching mode_positional's yfinance-derived ordering
+        # most-recent-first, matching the chart/table rendering order in
+        # mode_positional.py
         historical_data["years"].reverse()
         historical_data["revenues"].reverse()
         historical_data["cash_amounts"].reverse()
@@ -602,7 +598,7 @@ if __name__ == "__main__":
         data = get_fundamentals(sym)
         if data is None:
             print(f"{sym}: no usable data (page missing, blocked, or parser found nothing "
-                  f"— scan will fall back to yfinance for this stock)")
+                  f"— this stock would be skipped in a scan, no yfinance fallback)")
         else:
             print(f"{sym}: market_cap={data['market_cap']:.0f}  pe={data['pe_ratio']}  "
                   f"latest_fy_revenue={data['latest_fy_revenue']:.0f}  "

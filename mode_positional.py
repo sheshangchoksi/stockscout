@@ -31,7 +31,7 @@ import indicators
 import scanner_common as sc
 import screener
 import tickers as _tickers
-from scanner_common import sskey, get_state, set_state, yf
+from scanner_common import sskey, get_state, set_state
 
 MODE_KEY = sc.MODE_POSITIONAL
 
@@ -214,16 +214,9 @@ def _params_ui(mode_key: str) -> dict:
     with st.sidebar.expander("🌐 Fundamentals Source", expanded=False):
         st.caption(
             "Market cap, P/E, revenue/profit growth, and cash come from "
-            "screener.in by default — one HTTP call per stock instead of "
-            "four separate Yahoo calls, and no Yahoo rate limit attached. "
-            "Falls back to yfinance automatically for any stock screener.in "
-            "doesn't have a page for."
-        )
-        params["use_screener"] = st.checkbox(
-            "Use screener.in for fundamentals", value=True,
-            help="Uncheck to go back to yfinance for market cap/financials on every stock "
-                 "(slower, more Yahoo calls — useful if screener.in itself is unreachable).",
-            key=sskey(mode_key, "use_screener"),
+            "screener.in — one HTTP call per stock. No Yahoo/yfinance "
+            "involved anywhere in this app; a stock screener.in has no "
+            "usable page for is skipped rather than falling back to Yahoo."
         )
         screener_cache_ttl = st.number_input(
             "screener.in cache TTL (hours)", min_value=1, max_value=48, value=6, step=1,
@@ -281,19 +274,16 @@ def _bse_code_for(yf_symbol: str) -> "str | None":
 
 # ── CORE LOGIC: fetch ────────────────────────────────────────────────────
 def fetch_stock_data(yf_symbol: str, params: dict):
-    """History for technicals comes from NSE/BSE's own bhavcopy first (see
-    bhavcopy.py) — free EOD data with no Yahoo rate limit attached. Falls
-    back to yfinance's ticker.history() if bhavcopy has no usable data.
+    """History for technicals comes from NSE/BSE's own bhavcopy (see
+    bhavcopy.py) — free EOD data, no Yahoo involved. Fundamentals (market
+    cap, P/E, annual + quarterly P&L, cash) come from screener.in (see
+    screener.py) — one HTTP GET, also no Yahoo involved.
 
-    Fundamentals (market cap, P/E, annual + quarterly P&L, cash) come from
-    screener.in first (see screener.py) — one HTTP GET instead of four
-    separate Yahoo calls, and no Yahoo rate limit attached either. Falls
-    back to yfinance's financial statements only when screener.py returns
-    None (page not found, or the sidebar "🌐 Fundamentals Source" toggle in
-    _params_ui() disables it). When both bhavcopy and screener succeed for
-    a stock, this function makes zero Yahoo calls for it at all. ticker.info
-    is intentionally never called — the most throttled Yahoo endpoint, and
-    everything here is derivable from the financial statements + fast_info."""
+    There is no yfinance fallback for either: this app makes zero Yahoo/
+    yfinance calls, period. If bhavcopy has no usable daily history for a
+    symbol, or screener.in has no usable fundamentals for it, that symbol
+    is skipped (returns None, counted as 'failed' by the caller) rather
+    than falling back to Yahoo for it."""
     if sc.is_known_dead(yf_symbol):
         return None
 
@@ -303,116 +293,40 @@ def fetch_stock_data(yf_symbol: str, params: dict):
         return cached
 
     try:
-        ticker = yf.Ticker(yf_symbol)
-
         bhav = bhavcopy.get_daily_series(yf_symbol, trading_days=params["lookback_trading_days"])
-        if bhav is not None:
-            closes = bhav['close'].values
-            highs = bhav['high'].values
-            lows = bhav['low'].values
-            volumes = bhav['volume'].values
-        else:
-            hist = ticker.history(period="3mo", interval="1d")
-            if hist.empty:
-                sc.mark_dead_symbol(yf_symbol)
-                return None
-            closes = hist['Close'].values
-            highs = hist['High'].values
-            lows = hist['Low'].values
-            volumes = hist['Volume'].values
+        if bhav is None:
+            sc.mark_dead_symbol(yf_symbol)
+            return None
+        closes = bhav['close'].values
+        highs = bhav['high'].values
+        lows = bhav['low'].values
+        volumes = bhav['volume'].values
 
         price = closes[-1]
         prev_close = closes[-2] if len(closes) > 1 else price
         change = ((price - prev_close) / prev_close) * 100
 
-        fundamentals_source = "yfinance"
-        screener_data = None
-        if params.get("use_screener", True):
-            plain_symbol, _exch = _split_yf_symbol(yf_symbol)
-            screener_data = (
-                screener.get_fundamentals(plain_symbol, bse_code=_bse_code_for(yf_symbol))
-                if plain_symbol else None
-            )
+        plain_symbol, _exch = _split_yf_symbol(yf_symbol)
+        screener_data = (
+            screener.get_fundamentals(plain_symbol, bse_code=_bse_code_for(yf_symbol))
+            if plain_symbol else None
+        )
+        if screener_data is None:
+            # No yfinance fallback — without a screener.in page, this
+            # stock's fundamentals aren't obtainable, so skip it.
+            return None
 
-        if screener_data is not None:
-            fundamentals_source = "screener"
-            market_cap = screener_data["market_cap"]
-            pe_ratio = screener_data["pe_ratio"]
-            total_cash = screener_data["total_cash"]
-            latest_fy_revenue = screener_data["latest_fy_revenue"]
-            profit_margin = screener_data["profit_margin"]
-            qoq_revenue_growth = screener_data["qoq_revenue_growth"]
-            yoy_revenue_growth = screener_data["yoy_revenue_growth"]
-            qoq_profit_growth = screener_data["qoq_profit_growth"]
-            yoy_profit_growth = screener_data["yoy_profit_growth"]
-            historical_data = screener_data["historical_data"]
-        else:
-            fi = ticker.fast_info
-            market_cap = getattr(fi, 'market_cap', None) or 0
-
-            annual_inc = None
-            try:
-                annual_inc = ticker.income_stmt if hasattr(ticker, 'income_stmt') else ticker.financials
-            except Exception:
-                pass
-
-            annual_bs = None
-            try:
-                annual_bs = ticker.balance_sheet
-            except Exception:
-                pass
-
-            q_inc = None
-            try:
-                q_inc = ticker.quarterly_income_stmt if hasattr(ticker, 'quarterly_income_stmt') else ticker.quarterly_financials
-            except Exception:
-                pass
-
-            latest_fy_revenue = 0
-            if annual_inc is not None and not annual_inc.empty and 'Total Revenue' in annual_inc.index:
-                v = annual_inc.loc['Total Revenue'].iloc[0]
-                latest_fy_revenue = 0 if pd.isna(v) else v
-
-            total_cash = 0
-            if annual_bs is not None and not annual_bs.empty:
-                for cash_key in ('Cash And Cash Equivalents',
-                                  'Cash Cash Equivalents And Short Term Investments',
-                                  'Cash And Short Term Investments'):
-                    if cash_key in annual_bs.index:
-                        v = annual_bs.loc[cash_key].iloc[0]
-                        total_cash = 0 if pd.isna(v) else v
-                        break
-
-            profit_margin = None
-            if annual_inc is not None and not annual_inc.empty:
-                try:
-                    rev = annual_inc.loc['Total Revenue'].iloc[0] if 'Total Revenue' in annual_inc.index else None
-                    net = annual_inc.loc['Net Income'].iloc[0] if 'Net Income' in annual_inc.index else None
-                    if rev and net and not pd.isna(rev) and not pd.isna(net) and rev != 0:
-                        profit_margin = net / rev
-                except Exception:
-                    pass
-
-            pe_ratio = getattr(fi, 'p_e_ratio', None)
-
-            qoq_revenue_growth = yoy_revenue_growth = None
-            qoq_profit_growth = yoy_profit_growth = None
-
-            if q_inc is not None and not q_inc.empty:
-                if 'Total Revenue' in q_inc.index:
-                    revenues = [r for r in q_inc.loc['Total Revenue'].values if not pd.isna(r)]
-                    if len(revenues) >= 2:
-                        qoq_revenue_growth = ((revenues[0] - revenues[1]) / abs(revenues[1])) * 100 if revenues[1] != 0 else None
-                    if len(revenues) >= 4:
-                        yoy_revenue_growth = ((revenues[0] - revenues[3]) / abs(revenues[3])) * 100 if revenues[3] != 0 else None
-                if 'Net Income' in q_inc.index:
-                    profits = [p for p in q_inc.loc['Net Income'].values if not pd.isna(p)]
-                    if len(profits) >= 2:
-                        qoq_profit_growth = ((profits[0] - profits[1]) / abs(profits[1])) * 100 if profits[1] != 0 else None
-                    if len(profits) >= 4:
-                        yoy_profit_growth = ((profits[0] - profits[3]) / abs(profits[3])) * 100 if profits[3] != 0 else None
-
-            historical_data = get_historical_financials_from_data(annual_inc, annual_bs, market_cap)
+        fundamentals_source = "screener"
+        market_cap = screener_data["market_cap"]
+        pe_ratio = screener_data["pe_ratio"]
+        total_cash = screener_data["total_cash"]
+        latest_fy_revenue = screener_data["latest_fy_revenue"]
+        profit_margin = screener_data["profit_margin"]
+        qoq_revenue_growth = screener_data["qoq_revenue_growth"]
+        yoy_revenue_growth = screener_data["yoy_revenue_growth"]
+        qoq_profit_growth = screener_data["qoq_profit_growth"]
+        yoy_profit_growth = screener_data["yoy_profit_growth"]
+        historical_data = screener_data["historical_data"]
 
         cash_on_hand_to_mcap = (total_cash / market_cap * 100) if market_cap > 0 and total_cash > 0 else 0
         latest_fy_revenue_to_mcap = (latest_fy_revenue / market_cap) if market_cap > 0 and latest_fy_revenue > 0 else 0
@@ -453,51 +367,12 @@ def fetch_stock_data(yf_symbol: str, params: dict):
         return None
 
 
-def get_historical_financials_from_data(annual_inc, annual_bs, current_mcap):
-    historical = {'years': [], 'revenues': [], 'cash_amounts': [], 'sales_to_mcap': []}
-    try:
-        if annual_inc is None or annual_inc.empty:
-            return historical
-        years = list(annual_inc.columns[:3]) if len(annual_inc.columns) >= 3 else list(annual_inc.columns)
-        for year in years:
-            year_str = year.strftime('%Y') if hasattr(year, 'strftime') else str(year)
-            historical['years'].append(year_str)
-            if 'Total Revenue' in annual_inc.index:
-                v = annual_inc.loc['Total Revenue', year]
-                historical['revenues'].append(0 if pd.isna(v) else v)
-            else:
-                historical['revenues'].append(0)
-            cash = 0
-            if annual_bs is not None and not annual_bs.empty and year in annual_bs.columns:
-                for cash_key in ('Cash And Cash Equivalents',
-                                  'Cash Cash Equivalents And Short Term Investments',
-                                  'Cash And Short Term Investments'):
-                    if cash_key in annual_bs.index:
-                        v = annual_bs.loc[cash_key, year]
-                        cash = 0 if pd.isna(v) else v
-                        break
-            historical['cash_amounts'].append(cash)
-        for revenue in historical['revenues']:
-            historical['sales_to_mcap'].append(revenue / current_mcap if current_mcap > 0 and revenue > 0 else 0)
-    except Exception:
-        pass
-    return historical
-
-
 def fetch_live_price(yf_symbol: str):
-    """NSE/BSE's own live-quote endpoint first (free, no Yahoo rate limit) —
-    see bhavcopy.get_live_quote(). Falls back to yfinance's 1-minute-bar
-    call only if that returns nothing."""
-    quote = bhavcopy.get_live_quote(yf_symbol, bse_code=_bse_code_for(yf_symbol))
-    if quote is not None:
-        return quote
-    try:
-        data = yf.Ticker(yf_symbol).history(period="1d", interval="1m")
-        if data is not None and not data.empty:
-            return data['Close'].iloc[-1]
-        return None
-    except Exception:
-        return None
+    """NSE/BSE's own live-quote endpoint (free, no Yahoo involved) — see
+    bhavcopy.get_live_quote(). No yfinance fallback: if NSE/BSE's quote
+    endpoint has nothing for this symbol, there's no live price this call,
+    full stop."""
+    return bhavcopy.get_live_quote(yf_symbol, bse_code=_bse_code_for(yf_symbol))
 
 
 # ── CORE LOGIC: score ───────────────────────────────────────────────────

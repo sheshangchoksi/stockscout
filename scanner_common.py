@@ -4,7 +4,7 @@ scanner_common.py — Shared infrastructure for the Positional Scanner
 Provides:
   • Namespaced session_state / widget keys (sskey) so widget keys never
     collide across reruns.
-  • A single global Yahoo concurrency gate + bulletproof_fetch.
+  • A single global fetch concurrency gate + bulletproof_fetch.
   • Disk-backed dead-symbol skip list.
   • Disk-backed scan checkpoint/resume, so a killed process (host
     restarts, OOM, etc.) never loses more than the in-flight batch.
@@ -32,30 +32,9 @@ from typing import Callable, Iterable
 import pandas as pd
 import streamlit as st
 
-import yf_ratelimit
-from yf_ratelimit import safe_ticker as _rl_ticker, safe_download as _rl_download
-
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MODE_POSITIONAL = "positional"
-
-
-# ── yfinance shim (rate-limit-safe) ──────────────────────────────────────
-class _YFShim:
-    """So `yf.Ticker(...)` / `yf.download(...)` calls in mode_positional.py
-    transparently go through yf_ratelimit's session + cooldown + retry
-    machinery."""
-
-    @staticmethod
-    def Ticker(symbol, **_):
-        return _rl_ticker(symbol)
-
-    @staticmethod
-    def download(tickers_, **kwargs):
-        return _rl_download(tickers_, **kwargs)
-
-
-yf = _YFShim()
 
 
 # ── Namespaced keys ───────────────────────────────────────────────────────
@@ -76,26 +55,27 @@ def pop_state(mode_key: str, name: str, default=None):
 
 
 # ── Global concurrency gate ──────────────────────────────────────────────
-_YF_SEMAPHORE_COUNT = 6
-_YF_SEMAPHORE = threading.Semaphore(_YF_SEMAPHORE_COUNT)
+_FETCH_SEMAPHORE_COUNT = 6
+_FETCH_SEMAPHORE = threading.Semaphore(_FETCH_SEMAPHORE_COUNT)
 _SEM_LOCK = threading.Lock()
 
 
 def _set_semaphore(count: int) -> None:
-    global _YF_SEMAPHORE, _YF_SEMAPHORE_COUNT
+    global _FETCH_SEMAPHORE, _FETCH_SEMAPHORE_COUNT
     with _SEM_LOCK:
-        if count != _YF_SEMAPHORE_COUNT:
-            _YF_SEMAPHORE = threading.Semaphore(count)
-            _YF_SEMAPHORE_COUNT = count
+        if count != _FETCH_SEMAPHORE_COUNT:
+            _FETCH_SEMAPHORE = threading.Semaphore(count)
+            _FETCH_SEMAPHORE_COUNT = count
 
 
 def bulletproof_fetch(func, *args, **kwargs):
-    """Single-shot, semaphore-gated call. yf_ratelimit already retries every
-    individual Yahoo call internally with its own backoff before raising —
-    retrying the *whole* fetch again here on top of that multiplies delays
-    while holding a worker slot the entire time. So: call once, catch, bail.
+    """Single-shot, semaphore-gated call around one stock's fetch (bhavcopy
+    + screener.in, no Yahoo/yfinance involved). bhavcopy.py and screener.py
+    already retry/back off internally where that matters — retrying the
+    *whole* fetch again here on top of that multiplies delays while holding
+    a worker slot the entire time. So: call once, catch, bail.
     """
-    with _YF_SEMAPHORE:
+    with _FETCH_SEMAPHORE:
         try:
             return func(*args, **kwargs)
         except Exception:
@@ -388,27 +368,28 @@ def render_scan_mode_selector(mode_key: str, universe: list) -> list:
 # ── Sidebar: rate-limiting controls (workers / batching / retry) ───────────
 def render_rate_limit_controls(mode_key: str) -> dict:
     """Every value here is read straight from its widget and returned in
-    rate_cfg — nothing about worker count, batching, or retry/backoff is
-    hardcoded; run_scan() and yf_ratelimit.configure() apply exactly what's
-    set here."""
+    rate_cfg — nothing about worker count or batching is hardcoded;
+    run_scan() applies exactly what's set here. NSE/BSE bhavcopy and
+    screener.in's own request pacing/backoff are configured separately
+    (see bhavcopy.py and screener.py's own sidebar panel) since each
+    source has its own gentle rate rather than a shared Yahoo budget."""
     st.sidebar.markdown("---")
-    st.sidebar.subheader("⚡ Rate Limiting Controls")
+    st.sidebar.subheader("⚡ Scan Concurrency")
     st.sidebar.info(
-        "Concurrent scan, single shared Yahoo connection budget. Recommended "
-        "4–6 workers — Yahoo never sees more than (workers × calls/stock) "
-        "simultaneous connections. Reduce to 2–3 if you still see 429s."
+        "How many stocks are fetched at once. Lower this if NSE/BSE bhavcopy "
+        "or screener.in start returning errors under load."
     )
 
     max_workers = st.sidebar.slider(
         "Parallel workers", min_value=1, max_value=16, value=6, step=1,
-        help="How many stocks to fetch simultaneously. Lower if hitting 429s.",
+        help="How many stocks to fetch simultaneously.",
         key=sskey(mode_key, "max_workers"),
     )
     _set_semaphore(max_workers)
 
     batch_size = st.sidebar.number_input(
         "Batch size (0 = no batching)", min_value=0, max_value=1000, value=0, step=10,
-        help="Pause after every N stocks. 0 disables. Use 50–100 if heavy rate limiting.",
+        help="Pause after every N stocks. 0 disables. Use 50–100 if seeing errors under load.",
         key=sskey(mode_key, "batch_size"),
     )
     batch_pause = st.sidebar.number_input(
@@ -417,35 +398,11 @@ def render_rate_limit_controls(mode_key: str) -> dict:
         key=sskey(mode_key, "batch_pause"),
     )
 
-    with st.sidebar.expander("🔧 Retry / Backoff / Delay Settings"):
-        retry_max = st.number_input(
-            "Max retries per stock", min_value=1, max_value=10, value=3, step=1,
-            help="How many times yf_ratelimit retries a failed fetch before giving up.",
-            key=sskey(mode_key, "retry_max"),
-        )
-        retry_delay = st.number_input(
-            "Retry base backoff (sec)", min_value=0.5, max_value=30.0, value=3.0, step=0.5,
-            help="Base delay for exponential backoff on retries. Doubles each retry.",
-            key=sskey(mode_key, "retry_delay"),
-        )
-        min_delay = st.number_input(
-            "Min delay between requests (sec)", min_value=0.1, max_value=10.0, value=1.5, step=0.1,
-            help="Floor on the gap between any two outgoing Yahoo requests, shared across all workers.",
-            key=sskey(mode_key, "min_delay"),
-        )
-        cooldown = st.number_input(
-            "Cooldown after a 429 (sec)", min_value=1.0, max_value=180.0, value=35.0, step=5.0,
-            help="Shared pause applied to every worker after any 429 or silent empty-response block.",
-            key=sskey(mode_key, "cooldown"),
-        )
-        stats_interval = st.number_input(
-            "Stats update every N stocks", min_value=1, max_value=100, value=10, step=1,
-            help="How often the stats bar refreshes during scan.",
-            key=sskey(mode_key, "stats_interval"),
-        )
-
-    yf_ratelimit.configure(max_retries=retry_max, base_backoff=retry_delay,
-                            min_delay=min_delay, cooldown=cooldown)
+    stats_interval = st.sidebar.number_input(
+        "Stats update every N stocks", min_value=1, max_value=100, value=10, step=1,
+        help="How often the stats bar refreshes during scan.",
+        key=sskey(mode_key, "stats_interval"),
+    )
 
     dead_count = count_dead_symbols()
     if dead_count > 0:
@@ -461,8 +418,6 @@ def render_rate_limit_controls(mode_key: str) -> dict:
         "max_workers": max_workers,
         "batch_size": batch_size,
         "batch_pause": batch_pause,
-        "retry_max": retry_max,
-        "retry_delay": retry_delay,
         "stats_interval": stats_interval,
     }
 
@@ -564,23 +519,9 @@ def run_scan(mode_key: str, stocks_to_scan: list,
             return
         _last_live_update = now
 
-        yf_status = yf_ratelimit.get_status()
-        lines = []
-        if yf_status["cooldown_active"]:
-            lines.append(f"🧊 **Cooling down** — all workers paused for another "
-                         f"{yf_status['cooldown_remaining']:.0f}s (Yahoo rate limit)")
-        lines.append(f"🔌 {yf_status['inflight']} request(s) in flight · {max_workers} workers configured")
-
+        lines = [f"🔌 {max_workers} workers configured"]
         if _last_symbol["symbol"]:
             lines.append(f"{_last_symbol['icon']} Last: `{_last_symbol['symbol']}` — {_last_symbol['label']}")
-
-        events = yf_ratelimit.get_recent_events(4)
-        if events:
-            lines.append("")
-            lines.append("**Rate-limit activity:**")
-            for ev in reversed(events):
-                age = now - ev["ts"]
-                lines.append(f"&nbsp;&nbsp;{ev['message']} _{age:.0f}s ago_")
 
         live_status.markdown("\n\n".join(lines))
 
